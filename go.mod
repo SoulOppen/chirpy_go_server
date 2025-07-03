@@ -1,4 +1,4 @@
-module chirpy
+module //github.com/SoulOppen/chirpy_go_server
 
 go 1.24.4
 
