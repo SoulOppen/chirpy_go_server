@@ -21,6 +21,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	secret         string
 }
 
 type parameters struct {
@@ -29,8 +30,8 @@ type parameters struct {
 }
 
 type mail struct {
-	Password string `json:"password`
-	Email    string `json:"email"`
+	Password string
+	Email    string
 }
 
 type User struct {
@@ -39,7 +40,11 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 }
-
+type param struct {
+	User         User   `json:"user"`
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+}
 type Chirp struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
@@ -52,6 +57,7 @@ func main() {
 	godotenv.Load()
 
 	dbURL := os.Getenv("DB_URL")
+	secret := os.Getenv("SECRET_STRING")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Printf("%s\n", err)
@@ -63,6 +69,7 @@ func main() {
 
 	var apiCfg apiConfig
 	apiCfg.db = dbQueries
+	apiCfg.secret = secret
 
 	mux := http.NewServeMux()
 	fileServer := http.FileServer(http.Dir("."))
@@ -81,6 +88,9 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerValid)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdate)
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
@@ -94,6 +104,7 @@ func main() {
 
 // GET /api/chirps
 func (cfg *apiConfig) handleGetChirps(w http.ResponseWriter, r *http.Request) {
+
 	dbChirps, err := cfg.db.GetChirps(context.Background())
 	if err != nil {
 		respondWithError(w, 500, "Fail to connect to DB")
@@ -149,9 +160,20 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/chirps
 func (cfg *apiConfig) handlerValid(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(tokenString, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "error")
+		return
+	}
 	decoder := json.NewDecoder(r.Body)
 	body := parameters{}
-	err := decoder.Decode(&body)
+	err = decoder.Decode(&body)
 	if err != nil {
 		respondWithError(w, 500, "Invalid JSON body")
 		return
@@ -178,13 +200,13 @@ func (cfg *apiConfig) handlerValid(w http.ResponseWriter, r *http.Request) {
 
 	newChirp := database.InsertChirpsParams{
 		Body:   strings.Join(words, " "),
-		UserID: body.UserId,
+		UserID: userID,
 	}
 
 	chirp, err := cfg.db.InsertChirps(context.Background(), newChirp)
 	if err != nil {
 		fmt.Printf("Error inserting chirp: %v\n", err)
-		respondWithError(w, 400, "Could not insert chirp")
+		respondWithError(w, 401, "Could not insert chirp")
 		return
 	}
 
@@ -250,25 +272,121 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&inputMail)
 	if err != nil {
-		w.WriteHeader(401)
+		respondWithError(w, 401, "error")
 	}
 	CheckPassword, err := cfg.db.ReturnHashPassword(context.Background(), inputMail.Email)
 	if err != nil {
-		w.WriteHeader(401)
+		respondWithError(w, 401, "erorr")
 	}
 	err = auth.CheckPasswordHash(inputMail.Password, CheckPassword)
 	if err != nil {
-		w.WriteHeader(401)
+		respondWithError(w, 401, "error")
 	}
 	noPass, err := cfg.db.ReturnUserNotPassword(context.Background(), inputMail.Email)
 	if err != nil {
-		w.WriteHeader(401)
+		respondWithError(w, 401, "error")
 	}
+	tokenStr, err := auth.MakeJWT(noPass.ID, cfg.secret, 3600)
+	if err != nil {
+		respondWithError(w, 401, "error")
+	}
+	refreshTokenStr := uuid.NewString()
+	expiresAt := time.Now().Add(7 * 24 * time.Hour)
+
+	rt, err := cfg.db.RefreshToken(context.Background(), database.RefreshTokenParams{
+		Token:  refreshTokenStr,
+		UserID: noPass.ID,
+		ExpiresAt: sql.NullTime{
+			Time:  expiresAt,
+			Valid: true,
+		},
+		RevokedAt: sql.NullTime{
+			Valid: false,
+		},
+	})
+	if err != nil {
+		respondWithError(w, 401, "error")
+	}
+	respondWithJSON(w, 200, param{
+		User{
+			ID:        noPass.ID,
+			CreatedAt: noPass.CreatedAt,
+			UpdatedAt: noPass.UpdatedAt,
+			Email:     noPass.Email,
+		},
+		tokenStr,
+		rt.Token,
+	})
+}
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	type response struct {
+		Token string `json:"token"`
+	}
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+	idUser, err := cfg.db.GetUserFromRefreshToken(context.Background(), tokenString)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+	newToken, err := auth.MakeJWT(idUser, cfg.secret, 3600)
+	if err != nil {
+		respondWithError(w, 401, "Could not create token")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, response{
+		Token: newToken,
+	})
+}
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+	_, err = cfg.db.UpdateRefreshToken(context.Background(), tokenString)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+	w.WriteHeader(204)
+}
+func (cfg *apiConfig) handlerUpdate(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Error")
+		return
+	}
+	userID, err := auth.ValidateJWT(tokenString, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Couldn't validate JWT")
+		return
+	}
+	decoder := json.NewDecoder(r.Body)
+	Email := mail{}
+	err = decoder.Decode(&Email)
+	if err != nil {
+		respondWithError(w, 401, "Couldn't decode parameters")
+		return
+	}
+	hashedPassword, err := auth.HashPassword(Email.Password)
+	if err != nil {
+		respondWithError(w, 401, "Couldn't hash password")
+		return
+	}
+	user, err := cfg.db.UpdateUser(context.Background(), database.UpdateUserParams{
+		ID:             userID,
+		Email:          Email.Email,
+		HashedPassword: hashedPassword,
+	})
 	respondWithJSON(w, 200, User{
-		ID:        noPass.ID,
-		CreatedAt: noPass.CreatedAt,
-		UpdatedAt: noPass.UpdatedAt,
-		Email:     noPass.Email,
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
 	})
 }
 func respondWithError(w http.ResponseWriter, code int, msg string) {
