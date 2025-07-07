@@ -35,10 +35,11 @@ type mail struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Email       string    `json:"email"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 type param struct {
 	User         User   `json:"user"`
@@ -90,7 +91,9 @@ func main() {
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerHook)
 	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdate)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDelete)
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
@@ -238,10 +241,11 @@ func (cfg *apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userNew := User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	}
 
 	respondWithJSON(w, 201, userNew)
@@ -249,7 +253,6 @@ func (cfg *apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) handleGetOneChirp(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("chirpID")
 	chirpID, err := uuid.Parse(id)
-	fmt.Println(id)
 	if err != nil {
 		respondWithError(w, 404, "No tiene el formato correcto")
 		return
@@ -290,7 +293,10 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		respondWithError(w, 401, "error")
 	}
-	refreshTokenStr := uuid.NewString()
+	refreshTokenStr, err := auth.MakeRefreshToken()
+	if err != nil {
+		respondWithError(w, 401, "error")
+	}
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
 
 	rt, err := cfg.db.RefreshToken(context.Background(), database.RefreshTokenParams{
@@ -307,15 +313,22 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		respondWithError(w, 401, "error")
 	}
-	respondWithJSON(w, 200, param{
-		User{
-			ID:        noPass.ID,
-			CreatedAt: noPass.CreatedAt,
-			UpdatedAt: noPass.UpdatedAt,
-			Email:     noPass.Email,
-		},
-		tokenStr,
-		rt.Token,
+	respondWithJSON(w, 200, struct {
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		IsChirpyRed  bool      `json:"is_chirpy_red"`
+		Token        string    `json:"token"`
+		RefreshToken string    `json:"refresh_token"`
+	}{
+		ID:           noPass.ID,
+		CreatedAt:    noPass.CreatedAt,
+		UpdatedAt:    noPass.UpdatedAt,
+		Email:        noPass.Email,
+		IsChirpyRed:  noPass.IsChirpyRed.Bool,
+		Token:        tokenStr,
+		RefreshToken: rt.Token,
 	})
 }
 func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
@@ -382,12 +395,89 @@ func (cfg *apiConfig) handlerUpdate(w http.ResponseWriter, r *http.Request) {
 		Email:          Email.Email,
 		HashedPassword: hashedPassword,
 	})
+	if err != nil {
+		respondWithError(w, 401, "Error al actualizar")
+		return
+	}
 	respondWithJSON(w, 200, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	})
+}
+func (cfg *apiConfig) handlerDelete(w http.ResponseWriter, r *http.Request) {
+	idChirp := r.PathValue("chirpID")
+
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "Not token")
+		return
+	}
+
+	idUser, err := auth.ValidateJWT(tokenString, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Couldn't decode parameters")
+		return
+	}
+
+	u, err := uuid.Parse(idChirp)
+	if err != nil {
+		respondWithError(w, 400, "id is not uuid")
+		return
+	}
+
+	chirp, err := cfg.db.OneChirps(context.Background(), u)
+	if err != nil {
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+
+	if chirp.UserID != idUser {
+		respondWithError(w, 403, "Fail to delete no authorize")
+		return
+	}
+
+	_, err = cfg.db.DeleteChirp(context.Background(), u)
+	if err != nil {
+		respondWithError(w, 400, "Fail to delete")
+		return
+	}
+
+	w.WriteHeader(204)
+}
+func (cfg *apiConfig) handlerHook(w http.ResponseWriter, r *http.Request) {
+
+	type Param struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+	var param Param
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&param)
+	if err != nil {
+		respondWithError(w, 400, "no se pudo decodificar")
+		return
+	}
+	if param.Event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+	u, err := uuid.Parse(param.Data.UserID)
+	if err != nil {
+		respondWithError(w, 400, "can't convert id")
+		return
+	}
+	_, err = cfg.db.UpdateUserIsRed(context.Background(), u)
+	if err != nil {
+		respondWithError(w, 404, "not user id")
+		return
+	}
+	w.WriteHeader(204)
+
 }
 func respondWithError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
