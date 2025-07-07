@@ -22,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	secret         string
+	polkaKey       string
 }
 
 type parameters struct {
@@ -59,6 +60,7 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	secret := os.Getenv("SECRET_STRING")
+	polkaKey := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Printf("%s\n", err)
@@ -71,7 +73,7 @@ func main() {
 	var apiCfg apiConfig
 	apiCfg.db = dbQueries
 	apiCfg.secret = secret
-
+	apiCfg.polkaKey = polkaKey
 	mux := http.NewServeMux()
 	fileServer := http.FileServer(http.Dir("."))
 
@@ -455,9 +457,18 @@ func (cfg *apiConfig) handlerHook(w http.ResponseWriter, r *http.Request) {
 			UserID string `json:"user_id"`
 		} `json:"data"`
 	}
+	apikey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		respondWithError(w, 401, "doesn't exist apikey")
+		return
+
+	}
+	if apikey != cfg.polkaKey {
+		respondWithError(w, 401, "not authorize")
+	}
 	var param Param
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&param)
+	err = decoder.Decode(&param)
 	if err != nil {
 		respondWithError(w, 400, "no se pudo decodificar")
 		return
