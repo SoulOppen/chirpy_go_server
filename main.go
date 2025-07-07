@@ -109,12 +109,30 @@ func main() {
 
 // GET /api/chirps
 func (cfg *apiConfig) handleGetChirps(w http.ResponseWriter, r *http.Request) {
+	stringId := r.URL.Query().Get("author_id")
+	cleanId := strings.TrimSpace(stringId)
+	var dbChirps []database.Chirp
 
-	dbChirps, err := cfg.db.GetChirps(context.Background())
-	if err != nil {
-		respondWithError(w, 500, "Fail to connect to DB")
-		return
+	if cleanId == "" {
+		var err error
+		dbChirps, err = cfg.db.GetChirps(context.Background())
+		if err != nil {
+			respondWithError(w, 500, "Fail to connect to DB")
+			return
+		}
+	} else {
+		var err error
+		parseId, err := uuid.Parse(cleanId)
+		if err != nil {
+			respondWithError(w, 500, "Fail to connect to Parse")
+		}
+		dbChirps, err = cfg.db.GetChirpsByAuthor(context.Background(), parseId)
+		if err != nil {
+			respondWithError(w, 500, "Fail to connect to DB")
+			return
+		}
 	}
+
 	// Mapear a nuestro struct con tags JSON correctos
 	chirps := make([]Chirp, len(dbChirps))
 	for i, c := range dbChirps {

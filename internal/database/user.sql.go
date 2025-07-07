@@ -118,7 +118,7 @@ const updateUserIsRed = `-- name: UpdateUserIsRed :one
 UPDATE users 
 SET
     updated_at = NOW(),
-    is_chirpy_red=true
+    is_chirpy_red= true
 WHERE id = $1
 RETURNING id, created_at, updated_at, email, hashed_password, is_chirpy_red
 `
